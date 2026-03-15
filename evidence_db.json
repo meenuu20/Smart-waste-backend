@@ -1,0 +1,32 @@
+[
+  {
+    "id": "1c296759-ea49-4e48-999d-1279325b864f",
+    "timestamp": "2026-03-15T01:58:29",
+    "camera_id": "CAM-01",
+    "location": "Main Gate",
+    "confidence": 0.3657006621360779,
+    "details": {
+      "garbage_id": 3,
+      "state": "placed",
+      "person_absent_seconds": 0.0
+    },
+    "image_path": "D:\\Meenu Project\\CodexFolder\\backend\\storage\\images\\1c296759-ea49-4e48-999d-1279325b864f_dump_20260315_015829.jpg",
+    "video_path": "D:\\Meenu Project\\CodexFolder\\backend\\storage\\videos\\1c296759-ea49-4e48-999d-1279325b864f_dump_20260315_015829.mp4",
+    "created_at": "2026-03-14T20:28:40.348676Z"
+  },
+  {
+    "id": "b1d60bc9-f101-4d5b-bd48-350769bc718d",
+    "timestamp": "2026-03-15T01:56:12",
+    "camera_id": "CAM-01",
+    "location": "Main Gate",
+    "confidence": 0.38373976945877075,
+    "details": {
+      "garbage_id": 3,
+      "state": "placed",
+      "person_absent_seconds": 0.0
+    },
+    "image_path": "D:\\Meenu Project\\CodexFolder\\backend\\storage\\images\\b1d60bc9-f101-4d5b-bd48-350769bc718d_dump_20260315_015612.jpg",
+    "video_path": "D:\\Meenu Project\\CodexFolder\\backend\\storage\\videos\\b1d60bc9-f101-4d5b-bd48-350769bc718d_dump_20260315_015612.mp4",
+    "created_at": "2026-03-14T20:26:24.640734Z"
+  }
+]
