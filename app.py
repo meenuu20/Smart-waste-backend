@@ -67,6 +67,16 @@ def save_upload_file(upload: UploadFile, target_dir: Path, event_id: str):
     return destination
 
 
+def remove_event_media(event):
+    for key in ("image_path", "video_path"):
+        file_path = event.get(key)
+        if not file_path:
+            continue
+        path = Path(file_path)
+        if path.exists():
+            path.unlink()
+
+
 def serialize_event(event):
     image_path = event.get("image_path")
     video_path = event.get("video_path")
@@ -136,3 +146,12 @@ def get_evidence(event_id: str):
                 raise HTTPException(status_code=404, detail="Evidence files are missing")
             return serialize_event(event)
     raise HTTPException(status_code=404, detail="Evidence not found")
+
+
+@app.delete("/api/evidence")
+def delete_all_evidence():
+    events = load_events()
+    for event in events:
+        remove_event_media(event)
+    save_events([])
+    return {"message": "All evidence deleted successfully", "deleted_count": len(events)}
