@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import uuid
 from datetime import datetime
@@ -176,6 +177,7 @@ CAMERA_ID = "CAM-01"
 CAMERA_LOCATION = "Street1"
 VIDEO_EXTENSION = ".mp4"
 VIDEO_CODEC = "avc1"
+SHOW_DEBUG_WINDOW = os.getenv("SHOW_DEBUG_WINDOW", "").lower() in {"1", "true", "yes", "on"}
 
 @app.websocket("/api/stream")
 async def websocket_endpoint(websocket: WebSocket):
@@ -415,8 +417,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if elapsed > VIDEO_DURATION:
                     finalize_recording_local()
 
-            cv2.imshow("Backend WebSocket Stream View", annotated)
-            cv2.waitKey(1)
+            if SHOW_DEBUG_WINDOW:
+                cv2.imshow("Backend WebSocket Stream View", annotated)
+                cv2.waitKey(1)
 
     except WebSocketDisconnect:
         print("Pi Client WebSocket disconnected")
@@ -424,4 +427,5 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error handling WebSocket stream: {e}")
     finally:
         finalize_recording_local()
-        cv2.destroyAllWindows()
+        if SHOW_DEBUG_WINDOW:
+            cv2.destroyAllWindows()
