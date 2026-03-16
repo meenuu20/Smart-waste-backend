@@ -194,6 +194,9 @@ async def websocket_endpoint(websocket: WebSocket):
     garbage_carry_start_time = {}
     garbage_reported         = {}
     garbage_was_carried      = {}
+    carry_candidate_logged   = {}
+    stationary_logged        = {}
+    waiting_for_leave_logged = {}
     last_person_time = time.time()
     image_captured    = {}
     latest_person_garbage_frame = None
@@ -210,6 +213,24 @@ async def websocket_endpoint(websocket: WebSocket):
         cv2.imwrite(str(image_path), frame)
         print(f"[SAVE]  Image: {image_path}")
         return ts, str(image_path), True
+
+    def log_detection_event(level, g_id, message, **context):
+        context_str = " ".join(f"{key}={value}" for key, value in context.items())
+        suffix = f" {context_str}" if context_str else ""
+        print(f"[{level}] garbage_id={g_id} {message}{suffix}")
+
+    def set_garbage_state(g_id, new_state, reason, **context):
+        previous_state = garbage_state.get(g_id)
+        garbage_state[g_id] = new_state
+        previous_label = {0: "unknown", 1: "carried", 2: "placed", 3: "dumped"}.get(previous_state, "unset")
+        new_label = {0: "unknown", 1: "carried", 2: "placed", 3: "dumped"}.get(new_state, str(new_state))
+        log_detection_event(
+            "STATE",
+            g_id,
+            f"{previous_label} -> {new_label}",
+            reason=reason,
+            **context,
+        )
 
     def start_recording_local(ts, orig_w, orig_h, current_time, image_path=None, event_timestamp=None, confidence=0.0, details=None):
         nonlocal recording, video_writer, record_start_time, current_upload_event
@@ -329,6 +350,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     garbage_reported[g_id] = False
                     garbage_was_carried[g_id] = False
                     image_captured[g_id] = False
+                    carry_candidate_logged[g_id] = False
+                    stationary_logged[g_id] = False
+                    waiting_for_leave_logged[g_id] = False
+                    log_detection_event("TRACK", g_id, "initialized", state="unknown", confidence=f"{garbage_track['conf']:.2f}")
 
                 movement = np.linalg.norm(np.array(g_center) - np.array(garbage_positions[g_id])) if g_id in garbage_positions else 0
                 garbage_positions[g_id] = g_center
@@ -342,16 +367,48 @@ async def websocket_endpoint(websocket: WebSocket):
                     if person_near and movement > MOVEMENT_THRESHOLD:
                         if g_id not in garbage_carry_start_time:
                             garbage_carry_start_time[g_id] = current_time_val
+                            if not carry_candidate_logged.get(g_id):
+                                log_detection_event(
+                                    "CARRY",
+                                    g_id,
+                                    "carry candidate started",
+                                    movement=f"{movement:.2f}",
+                                    threshold=MOVEMENT_THRESHOLD,
+                                )
+                                carry_candidate_logged[g_id] = True
                         if current_time_val - garbage_carry_start_time[g_id] > CARRY_CONFIRM_SECONDS:
-                            garbage_state[g_id] = 1
+                            set_garbage_state(
+                                g_id,
+                                1,
+                                "movement confirmed near person",
+                                movement=f"{movement:.2f}",
+                                person_near=person_near,
+                            )
                             garbage_was_carried[g_id] = True
                             garbage_stationary_time.pop(g_id, None)
+                            stationary_logged[g_id] = False
                     elif movement < MOVEMENT_THRESHOLD and garbage_was_carried[g_id]:
                         garbage_carry_start_time.pop(g_id, None)
+                        carry_candidate_logged[g_id] = False
                         if g_id not in garbage_stationary_time:
                             garbage_stationary_time[g_id] = current_time_val
+                            if not stationary_logged.get(g_id):
+                                log_detection_event(
+                                    "PLACE",
+                                    g_id,
+                                    "stationary timer started",
+                                    movement=f"{movement:.2f}",
+                                    threshold=MOVEMENT_THRESHOLD,
+                                )
+                                stationary_logged[g_id] = True
                         if current_time_val - garbage_stationary_time[g_id] > STATIONARY_SECONDS:
-                            garbage_state[g_id] = 2
+                            set_garbage_state(
+                                g_id,
+                                2,
+                                "stationary after being carried",
+                                stationary_for=f"{current_time_val - garbage_stationary_time[g_id]:.2f}",
+                            )
+                            waiting_for_leave_logged[g_id] = False
                             if not image_captured[g_id]:
                                 snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
                                 ts, image_path, saved = save_image_local(snapshot_frame)
@@ -363,13 +420,30 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         garbage_carry_start_time.pop(g_id, None)
                         garbage_stationary_time.pop(g_id, None)
+                        carry_candidate_logged[g_id] = False
+                        stationary_logged[g_id] = False
 
                 elif state == 1:
                     if movement < MOVEMENT_THRESHOLD:
                         if g_id not in garbage_stationary_time:
                             garbage_stationary_time[g_id] = current_time_val
+                            if not stationary_logged.get(g_id):
+                                log_detection_event(
+                                    "PLACE",
+                                    g_id,
+                                    "stationary timer started",
+                                    movement=f"{movement:.2f}",
+                                    threshold=MOVEMENT_THRESHOLD,
+                                )
+                                stationary_logged[g_id] = True
                         if current_time_val - garbage_stationary_time[g_id] > STATIONARY_SECONDS:
-                            garbage_state[g_id] = 2
+                            set_garbage_state(
+                                g_id,
+                                2,
+                                "stationary after carried state",
+                                stationary_for=f"{current_time_val - garbage_stationary_time[g_id]:.2f}",
+                            )
+                            waiting_for_leave_logged[g_id] = False
                             if not image_captured[g_id]:
                                 snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
                                 ts, image_path, saved = save_image_local(snapshot_frame)
@@ -380,6 +454,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     current_upload_event["image_path"] = image_path
                     else:
                         garbage_stationary_time.pop(g_id, None)
+                        stationary_logged[g_id] = False
 
                 elif state == 2:
                     if not image_captured[g_id] and latest_person_garbage_frame is not None:
@@ -393,9 +468,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         annotated, f"Dump in {remaining:.1f}s" if not persons else "Waiting for person to leave",
                         (int(g_center[0]) - 60, int(g_center[1]) + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1
                     )
+                    if not persons and not waiting_for_leave_logged.get(g_id):
+                        log_detection_event(
+                            "WAIT",
+                            g_id,
+                            "waiting for person absence timer",
+                            person_absent=f"{person_absent_seconds:.2f}",
+                            required=PERSON_GONE_SECONDS,
+                        )
+                        waiting_for_leave_logged[g_id] = True
+                    elif persons and waiting_for_leave_logged.get(g_id):
+                        log_detection_event("WAIT", g_id, "person returned near placed object")
+                        waiting_for_leave_logged[g_id] = False
 
                     if person_absent_seconds >= PERSON_GONE_SECONDS and not garbage_reported[g_id]:
-                        garbage_state[g_id] = 3
+                        set_garbage_state(
+                            g_id,
+                            3,
+                            "person absent threshold reached",
+                            person_absent=f"{person_absent_seconds:.2f}",
+                        )
                         garbage_reported[g_id] = True
                         if not image_captured[g_id]:
                             snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
