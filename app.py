@@ -4,9 +4,15 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
+import cv2
+import numpy as np
+import time
+from collections import deque
+import struct
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -155,3 +161,267 @@ def delete_all_evidence():
         remove_event_media(event)
     save_events([])
     return {"message": "All evidence deleted successfully", "deleted_count": len(events)}
+
+
+# ===================== STREAMING LOGIC GLOBALS =====================
+PERSON_GONE_SECONDS   = 3.0   
+STATIONARY_SECONDS    = 2.0   
+CARRY_CONFIRM_SECONDS = 0.4   
+MOVEMENT_THRESHOLD    = 2    
+PERSON_NEAR_DIST      = 450   
+
+VIDEO_DURATION = 20  
+PRE_EVENT_SECONDS = 8  
+CAMERA_ID = "CAM-01"
+CAMERA_LOCATION = "Street1"
+VIDEO_EXTENSION = ".mp4"
+VIDEO_CODEC = "avc1"
+
+@app.websocket("/api/stream")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("Pi Client Connected via WebSocket")
+    
+    # Connection-specific state
+    camera_fps = 20.0
+    pre_event_buffer = deque(maxlen=max(1, int(camera_fps * PRE_EVENT_SECONDS)))
+    
+    garbage_positions        = {}
+    garbage_state            = {}   # 0=unknown 1=carried 2=placed 3=dumped
+    garbage_stationary_time  = {}
+    garbage_carry_start_time = {}
+    garbage_reported         = {}
+    garbage_was_carried      = {}
+    last_person_time = time.time()
+    image_captured    = {}
+    latest_person_garbage_frame = None
+
+    recording = False
+    video_writer = None
+    record_start_time = None
+    current_upload_event = None
+
+    def save_image_local(frame):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        image_name = f"dump_{ts}.jpg"
+        image_path = IMAGE_DIR / image_name
+        cv2.imwrite(str(image_path), frame)
+        print(f"[SAVE]  Image: {image_path}")
+        return ts, str(image_path), True
+
+    def start_recording_local(ts, orig_w, orig_h, current_time, image_path=None, event_timestamp=None, confidence=0.0, details=None):
+        nonlocal recording, video_writer, record_start_time, current_upload_event
+        video_name = f"dump_{ts}{VIDEO_EXTENSION}"
+        video_path = VIDEO_DIR / video_name
+        fourcc = cv2.VideoWriter_fourcc(*VIDEO_CODEC)
+        video_writer = cv2.VideoWriter(str(video_path), fourcc, camera_fps, (orig_w, orig_h))
+        
+        for buffered_frame in pre_event_buffer:
+            video_writer.write(buffered_frame)
+
+        recording = True
+        record_start_time = current_time
+        current_upload_event = {
+            "timestamp": event_timestamp or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "camera_id": CAMERA_ID,
+            "location": CAMERA_LOCATION,
+            "confidence": float(confidence),
+            "details": details or {},
+            "image_path": str(image_path) if image_path else None,
+            "video_path": str(video_path),
+        }
+        print(f"[SAVE]  Recording with pre-event buffer: {video_path}")
+
+    def finalize_recording_local():
+        nonlocal recording, video_writer, record_start_time, current_upload_event
+        if not recording: return
+        recording = False
+        if video_writer is not None:
+            video_writer.release()
+            video_writer = None
+        
+        # Save to internal DB directly
+        if current_upload_event:
+            event_id = str(uuid.uuid4())
+            event = {
+                "id": event_id,
+                "timestamp": current_upload_event["timestamp"],
+                "camera_id": current_upload_event["camera_id"],
+                "location": current_upload_event["location"],
+                "confidence": current_upload_event["confidence"],
+                "details": current_upload_event["details"],
+                "image_path": current_upload_event["image_path"],
+                "video_path": current_upload_event["video_path"],
+                "created_at": datetime.utcnow().isoformat() + "Z",
+            }
+            events_db = load_events()
+            events_db.insert(0, event)
+            save_events(events_db)
+
+        record_start_time = None
+        current_upload_event = None
+        print("[SAVE] Event saved internally to DB")
+
+    try:
+        while True:
+            # We expect Pi Client to send a single binary message with header + meta + frame
+            payload = await websocket.receive_bytes()
+            if len(payload) < 8:
+                continue
+            
+            meta_len, frame_len = struct.unpack("!II", payload[:8])
+            
+            if len(payload) < 8 + meta_len + frame_len:
+                print("Incomplete payload received over WS")
+                continue
+
+            meta_bytes = payload[8:8+meta_len]
+            frame_bytes = payload[8+meta_len:8+meta_len+frame_len]
+            
+            metadata = json.loads(meta_bytes.decode('utf-8'))
+            frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            orig_w = metadata["orig_w"]
+            orig_h = metadata["orig_h"]
+            current_time_val = metadata["timestamp"]
+            persons = metadata["persons"]
+            garbages = metadata["garbages"]
+            tracks = metadata["tracks"]
+
+            pre_event_buffer.append(frame.copy())
+            annotated = frame.copy()
+
+            for tid_str, track in tracks.items():
+                x1, y1, x2, y2 = track["box"]
+                cn = track["class_name"]
+                color = (0, 255, 0) if cn == "person" else (0, 165, 255)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    annotated, f"{cn} {tid_str} {track['conf']:.2f}",
+                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2
+                )
+
+            if persons:
+                last_person_time = current_time_val
+
+            if persons and garbages:
+                latest_person_garbage_frame = frame.copy()
+
+            person_absent_seconds = current_time_val - last_person_time
+            status_text  = "Person: PRESENT" if persons else f"Person absent: {person_absent_seconds:.1f}s"
+            status_color = (0, 255, 0) if persons else (0, 165, 255)
+            cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
+
+            state_labels = {0: "unknown", 1: "carried", 2: "placed", 3: "DUMPED"}
+            
+            for g_id, g_center in garbages.items():
+                garbage_track = tracks[g_id]
+                image_path = None
+
+                if g_id not in garbage_state:
+                    garbage_state[g_id]    = 0
+                    garbage_reported[g_id] = False
+                    garbage_was_carried[g_id] = False
+                    image_captured[g_id] = False
+
+                movement = np.linalg.norm(np.array(g_center) - np.array(garbage_positions[g_id])) if g_id in garbage_positions else 0
+                garbage_positions[g_id] = g_center
+
+                person_near = any(np.linalg.norm(np.array(p) - np.array(g_center)) < PERSON_NEAR_DIST for p in persons.values())
+                state = garbage_state[g_id]
+
+                cv2.putText(annotated, f"[{state_labels.get(state,'?')}]", (int(g_center[0]) - 30, int(g_center[1]) + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                if state == 0:
+                    if person_near and movement > MOVEMENT_THRESHOLD:
+                        if g_id not in garbage_carry_start_time:
+                            garbage_carry_start_time[g_id] = current_time_val
+                        if current_time_val - garbage_carry_start_time[g_id] > CARRY_CONFIRM_SECONDS:
+                            garbage_state[g_id] = 1
+                            garbage_was_carried[g_id] = True
+                            garbage_stationary_time.pop(g_id, None)
+                    elif movement < MOVEMENT_THRESHOLD and garbage_was_carried[g_id]:
+                        garbage_carry_start_time.pop(g_id, None)
+                        if g_id not in garbage_stationary_time:
+                            garbage_stationary_time[g_id] = current_time_val
+                        if current_time_val - garbage_stationary_time[g_id] > STATIONARY_SECONDS:
+                            garbage_state[g_id] = 2
+                            if not image_captured[g_id]:
+                                snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
+                                ts, image_path, saved = save_image_local(snapshot_frame)
+                                image_captured[g_id] = saved
+                                if not recording:
+                                    start_recording_local(ts, orig_w, orig_h, current_time_val, image_path, confidence=garbage_track["conf"], details={"garbage_id": g_id, "state": "placed_from_unknown"})
+                                elif current_upload_event and not current_upload_event.get("image_path"):
+                                    current_upload_event["image_path"] = image_path
+                    else:
+                        garbage_carry_start_time.pop(g_id, None)
+                        garbage_stationary_time.pop(g_id, None)
+
+                elif state == 1:
+                    if movement < MOVEMENT_THRESHOLD:
+                        if g_id not in garbage_stationary_time:
+                            garbage_stationary_time[g_id] = current_time_val
+                        if current_time_val - garbage_stationary_time[g_id] > STATIONARY_SECONDS:
+                            garbage_state[g_id] = 2
+                            if not image_captured[g_id]:
+                                snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
+                                ts, image_path, saved = save_image_local(snapshot_frame)
+                                image_captured[g_id] = saved
+                                if not recording:
+                                    start_recording_local(ts, orig_w, orig_h, current_time_val, image_path, confidence=garbage_track["conf"], details={"garbage_id": g_id, "state": "placed"})
+                                elif current_upload_event and not current_upload_event.get("image_path"):
+                                    current_upload_event["image_path"] = image_path
+                    else:
+                        garbage_stationary_time.pop(g_id, None)
+
+                elif state == 2:
+                    if not image_captured[g_id] and latest_person_garbage_frame is not None:
+                        _, image_path, saved = save_image_local(latest_person_garbage_frame)
+                        image_captured[g_id] = saved
+                        if current_upload_event and saved and not current_upload_event.get("image_path"):
+                            current_upload_event["image_path"] = image_path
+
+                    remaining = max(0, PERSON_GONE_SECONDS - person_absent_seconds)
+                    cv2.putText(
+                        annotated, f"Dump in {remaining:.1f}s" if not persons else "Waiting for person to leave",
+                        (int(g_center[0]) - 60, int(g_center[1]) + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1
+                    )
+
+                    if person_absent_seconds >= PERSON_GONE_SECONDS and not garbage_reported[g_id]:
+                        garbage_state[g_id] = 3
+                        garbage_reported[g_id] = True
+                        if not image_captured[g_id]:
+                            snapshot_frame = latest_person_garbage_frame if latest_person_garbage_frame is not None else frame
+                            _, image_path, saved = save_image_local(snapshot_frame)
+                            image_captured[g_id] = saved
+                            if current_upload_event and saved and not current_upload_event.get("image_path"):
+                                current_upload_event["image_path"] = image_path
+                        if not recording:
+                            ts = time.strftime("%Y%m%d_%H%M%S")
+                            start_recording_local(ts, orig_w, orig_h, current_time_val, image_path if image_captured[g_id] else None, confidence=garbage_track["conf"], details={"garbage_id": g_id, "state": "dumped"})
+
+                elif state == 3:
+                    cv2.putText(annotated, "!! DUMPING DETECTED !!", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+            if recording:
+                video_writer.write(frame)
+                elapsed = time.time() - record_start_time
+                cv2.putText(annotated, f"REC {elapsed:.0f}/{VIDEO_DURATION}s", (orig_w - 160, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                if elapsed > VIDEO_DURATION:
+                    finalize_recording_local()
+
+            cv2.imshow("Backend WebSocket Stream View", annotated)
+            cv2.waitKey(1)
+
+    except WebSocketDisconnect:
+        print("Pi Client WebSocket disconnected")
+    except Exception as e:
+        print(f"Error handling WebSocket stream: {e}")
+    finally:
+        finalize_recording_local()
+        cv2.destroyAllWindows()
