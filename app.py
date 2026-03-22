@@ -164,6 +164,26 @@ def delete_all_evidence():
     return {"message": "All evidence deleted successfully", "deleted_count": len(events)}
 
 
+@app.delete("/api/evidence/{event_id}")
+def delete_evidence(event_id: str):
+    events = load_events()
+    remaining_events = []
+    deleted_event = None
+
+    for event in events:
+        if event["id"] == event_id:
+            deleted_event = event
+            continue
+        remaining_events.append(event)
+
+    if deleted_event is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    remove_event_media(deleted_event)
+    save_events(remaining_events)
+    return {"message": "Evidence deleted successfully", "deleted_id": event_id}
+
+
 # ===================== STREAMING LOGIC GLOBALS =====================
 PERSON_GONE_SECONDS   = 3.0   
 STATIONARY_SECONDS    = 2.0   
